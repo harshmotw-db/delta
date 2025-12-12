@@ -1798,19 +1798,20 @@ trait DataSkippingDeltaTestsBase extends DeltaExcludedBySparkVersionTestMixinShi
   testSparkMasterOnly("data skipping by stats - variant type") {
     Seq(false, true).foreach { pushVariantIntoScan =>
       withSQLConf(SQLConf.PUSH_VARIANT_INTO_SCAN.key -> pushVariantIntoScan.toString) {
-        withTable("tbl") {
-          sql("""CREATE TABLE tbl(v VARIANT,
+        val tableName = s"tbl_$pushVariantIntoScan"
+        withTable(tableName) {
+          sql(s"""CREATE TABLE $tableName(v VARIANT,
                   v_struct STRUCT<v: VARIANT>,
                   null_v VARIANT,
                   null_v_struct STRUCT<v: VARIANT>) USING DELTA""")
-          sql("""INSERT INTO tbl (SELECT
+          sql(s"""INSERT INTO $tableName (SELECT
               parse_json(cast(id as string)),
               named_struct('v', parse_json(cast(id as string))),
               cast(null as variant),
               named_struct('v', cast(null as variant))
               FROM range(100))""")
 
-          val deltaLog = DeltaLog.forTable(spark, TableIdentifier("tbl", None, None))
+          val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tableName, None, None))
           val hits = Seq(
             "v IS NOT NULL",
             "v_struct.v IS NOT NULL",
@@ -1821,7 +1822,7 @@ trait DataSkippingDeltaTestsBase extends DeltaExcludedBySparkVersionTestMixinShi
             "v_struct.v IS NULL",
             "null_v IS NOT NULL",
             "null_v_struct.v IS NOT NULL")
-          val data = spark.sql("select * from tbl").collect().toSeq.toString
+          val data = spark.sql(s"select * from $tableName").collect().toSeq.toString
           checkSkipping(deltaLog, hits, misses, data, false)
         }
       }
