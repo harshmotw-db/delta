@@ -1800,15 +1800,15 @@ trait DataSkippingDeltaTestsBase extends DeltaExcludedBySparkVersionTestMixinShi
       withSQLConf(SQLConf.PUSH_VARIANT_INTO_SCAN.key -> pushVariantIntoScan.toString) {
         withTable("tbl") {
           sql("""CREATE TABLE tbl(v VARIANT,
-              v_struct STRUCT<v: VARIANT>,
-              null_v VARIANT,
-              null_v_struct STRUCT<v: VARIANT>) USING DELTA""")
+                  v_struct STRUCT<v: VARIANT>,
+                  null_v VARIANT,
+                  null_v_struct STRUCT<v: VARIANT>) USING DELTA""")
           sql("""INSERT INTO tbl (SELECT
-          parse_json(cast(id as string)),
-          named_struct('v', parse_json(cast(id as string))),
-          cast(null as variant),
-          named_struct('v', cast(null as variant))
-          FROM range(100))""")
+              parse_json(cast(id as string)),
+              named_struct('v', parse_json(cast(id as string))),
+              cast(null as variant),
+              named_struct('v', cast(null as variant))
+              FROM range(100))""")
 
           val deltaLog = DeltaLog.forTable(spark, TableIdentifier("tbl", None, None))
           val hits = Seq(
