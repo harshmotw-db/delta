@@ -1915,7 +1915,7 @@ To support this feature:
 - The feature `variantType` must exist in the table `protocol`'s `readerFeatures` and `writerFeatures`.
 - The feature `variantShredding` must exist in the table `protocol`'s `readerFeatures` and `writerFeatures`.
 
-Tables supporting Variant Shredding may contain parquet files containing Variants represented in the "unshredded" format.
+Tables supporting Variant Shredding may also contain parquet files containing Variants represented in the "unshredded" format.
 
 ## Shredded Variant data in Parquet
 
