@@ -1862,7 +1862,7 @@ To support this feature:
 The Variant data type is logically represented as two binary encoded values, according to the [Parquet Variant binary encoding specification](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md).
 The two binary values are named `value` and `metadata`.
 
-In parquet files, Variant can be represented in a "[shredded](https://github.com/apache/parquet-format/blob/master/VariantShredding.md)" format or an "[unshredded](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)" format. Tables containing "shredded" variants also contain the [Variant Shredding](#variant-shredding) feature.
+In parquet files, Variant can be represented in a "[shredded](https://github.com/apache/parquet-format/blob/master/VariantShredding.md)" format or an "[unshredded](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)" format. Tables containing "shredded" variants must also enable the [Variant Shredding](#variant-shredding) feature.
 
 When writing unshredded Variant data to parquet files, the Variant data is written as a single Parquet struct, with the following fields:
 
@@ -1904,7 +1904,7 @@ Change Data Feed | **Supported:** A table using the Variant data type is allowed
 # Variant Shredding
 
 This feature enables support for shredding of the Variant data type, to store and query Variant data more efficiently.
-Shredding a Variant value is taking paths from the Variant value, and storing them as a typed column in the file.
+Shredding a Variant value takes paths from the Variant value, and stores them as typed columns in the file.
 The shredding does not duplicate data, so if a value is stored in the typed column, it is removed from the Variant binary.
 Storing Variant values as typed columns is faster to access, and enables data skipping with statistics.
 
