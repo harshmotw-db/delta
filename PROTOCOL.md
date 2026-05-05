@@ -1905,7 +1905,7 @@ Change Data Feed | **Supported:** A table using the Variant data type is allowed
 # Variant Shredding
 
 This feature enables support for shredding of the Variant data type, to store and query Variant data more efficiently.
-Shredding a Variant value is taking paths from the Variant value, and storing them as a typed column in the file.
+Shredding a Variant value takes paths from the Variant value, and stores them as typed columns in the file.
 The shredding does not duplicate data, so if a value is stored in the typed column, it is removed from the Variant binary.
 Storing Variant values as typed columns is faster to access, and enables data skipping with statistics.
 
@@ -2627,7 +2627,8 @@ maxValues | A value that is equal to the largest valid value[^1] present in the 
 - Each path in the Variant `minValues` (`maxValues`) value is the independently computed min (max) stat for the corresponding path in the file's Variant data, so e.g. `minValues.v:a` and `minValues.v:b` could come from different rows in the file.
 - Min/max stats may only be written for primitive (leaf) values, packed into a Variant representation.
 - Min/max stats may only be written for a path if that path has the same data type in every row of the data file.
-- The paths and types inside `minValues` and `maxValues` must be the same within any one file, but can vary from file to file.
+- If a path is present in both minValues and maxValues for a given file, the Variant type for that path must be the same in both.
+- A path may be present in minValues but not maxValues (or vice versa) for a given file. The paths and types can vary from file to file.
 - Subject to the above constraints, the writer of a given file determines which Variant leaf paths (if any) to emit statistics for.
 
 For a table with a single Variant column (`varCol: variant`) in its data schema, example statistics in JSON would look like:
