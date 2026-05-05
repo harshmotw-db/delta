@@ -1831,6 +1831,7 @@ The schema serialization method is described in [Schema Serialization Format](#s
 To support this feature:
 - The table must be on Reader Version 3 and Writer Version 7
 - The feature `variantType` must exist in the table `protocol`'s `readerFeatures` and `writerFeatures`.
+- The feature `variantShredding` may also exist in the table `protocol`'s `readerFeatures` and `writerFeatures` (see [Variant Shredding](#variant-shredding)).
 
 ## Example JSON-Encoded Delta Table Schema with Variant types
 
@@ -1862,7 +1863,7 @@ To support this feature:
 The Variant data type is logically represented as two binary encoded values, according to the [Parquet Variant binary encoding specification](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md).
 The two binary values are named `value` and `metadata`.
 
-In parquet files, Variant can be represented in a "[shredded](https://github.com/apache/parquet-format/blob/master/VariantShredding.md)" format or an "[unshredded](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)" format. Tables containing "shredded" variants also contain the [Variant Shredding](#variant-shredding) feature.
+In parquet files, Variant can be represented in a "[shredded](https://github.com/apache/parquet-format/blob/master/VariantShredding.md)" format or an "[unshredded](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)" format. Tables containing "shredded" variants must also enable the [Variant Shredding](#variant-shredding) feature.
 
 When writing unshredded Variant data to parquet files, the Variant data is written as a single Parquet struct, with the following fields:
 
@@ -1910,12 +1911,12 @@ Storing Variant values as typed columns is faster to access, and enables data sk
 
 The `variantShredding` feature depends on the `variantType` feature.
 
-To support this feature:
-- The table must be on Reader Version 3 and Writer Version 7
+Tables supporting Variant Shredding may also contain parquet files containing Variants represented in the "unshredded" format, and individual files may freely mix shredded and unshredded Variant columns.
+
+## Enablement
+- The table must be on Reader Version 3 and Writer Version 7.
 - The feature `variantType` must exist in the table `protocol`'s `readerFeatures` and `writerFeatures`.
 - The feature `variantShredding` must exist in the table `protocol`'s `readerFeatures` and `writerFeatures`.
-
-Tables supporting Variant Shredding may also contain parquet files containing Variants represented in the "unshredded" format.
 
 ## Shredded Variant data in Parquet
 
@@ -1925,14 +1926,15 @@ The shredded Variant data written to parquet files is written as a single Parque
 Struct field name | Parquet primitive type | Description
 -|-|-
 metadata | binary | (required) The binary-encoded Variant metadata, as described in [Parquet Variant binary encoding](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)
-value | binary | (optional) The binary-encoded Variant value, as described in [Parquet Variant binary encoding](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)
-typed_value | * | (optional) This can be any Parquet type, representing the data stored in the Variant. Details of the shredding scheme is found in the [Variant Shredding specification](https://github.com/apache/parquet-format/blob/master/VariantShredding.md)
+value | binary | (optional) The binary-encoded Variant value, as described in Parquet Variant binary encoding.
+typed_value | * | (optional) This can be any Parquet type representing the data stored in the Variant, so long as the shredding scheme adheres to the Parquet Variant Shredding spec. Details of the shredding scheme is found in the Parquet Variant Shredding specification.
 
 ## Writer Requirements for Variant Shredding
 
 When Variant Shredding is supported (`writerFeatures` field of a table's `protocol` action contains `variantShredding`), writers:
 - must respect the `delta.enableVariantShredding` table property configuration. If `delta.enableVariantShredding` is not present or if it is set to any value other than `true`, a column of type `variant` must not be written as a shredded Variant, but as an unshredded Variant. If `delta.enableVariantShredding=true`, the writer can choose to shred a Variant column according to the [Parquet Variant Shredding specification](https://github.com/apache/parquet-format/blob/master/VariantShredding.md).
 - must ensure the `variantShredding` table feature is present in the table protocol's `writerFeatures` and `readerFeatures` when enabling the `delta.enableVariantShredding` table property, i.e. setting `delta.enableVariantShredding=true`.
+- must ensure the `variantType` table feature is present in the table protocol's `writerFeature`
 
 ## Reader Requirements for Variant Shredding
 
@@ -2486,6 +2488,7 @@ Property | Description | Details
 -|-|-
 `delta.parquet.compression.codec` | Compression codec writers SHOULD use for new Parquet data and checkpoint files. Changing this property does not affect existing files; a table may contain files written with different codecs, which is a normal and expected state. | Widely supported values (matched case-insensitively): `uncompressed`/`none` (no compression), `snappy`, `gzip`, `lz4` (deprecated, Hadoop framing), `lz4_raw` ([LZ4 block format](https://parquet.apache.org/docs/file-format/data-pages/compression/#lz4_raw)), `zstd`.<br><br>When absent, writers SHOULD default to `zstd`. If a writer does not support or recognize the specified codec, it SHOULD abort with an appropriate error or fall back to a default codec.<br><br>Readers SHOULD support all codecs listed above regardless of the current property value. Parquet files written with other [parquet-supported codecs](https://parquet.apache.org/docs/file-format/data-pages/compression/) may also exist; readers MAY support reading these files.
 `delta.parquet.format.version` | Parquet data page format writers SHOULD use for new data files. This property is a directive to writers only; readers do not need to consult it, as Parquet pages are self-describing via the `PageType` field in each page header. Changing this property does not affect existing files; a table MAY contain files written with different data page versions, which is a normal and expected state. | Valid values: `1.0.0` (DataPageV1) and `2.x.x` (DataPageV2, where `x.x` is any minor.patch version). Recommended values are `1.0.0` and `2.12.0`.<br><br>When absent, writers SHOULD default to `1.0.0`. Writers SHOULD validate this property and abort if the value does not match `1.0.0` or `2.MINOR.PATCH`.<br><br>Readers SHOULD support both DataPageV1 and DataPageV2 pages regardless of this property's value. Tables intended for access by engines beyond the Delta Lake connectors SHOULD use `1.0.0`, as DataPageV2 support varies across the broader Parquet ecosystem.
+`delta.enableVariantShredding` | When `true`, writers could write variant data to parquet files in [shredded](#variant-shredding) format. | Valid values: `true` (shredding allowed) and `false` (shredding not allowed).<br><br>When enabled, writers must ensure that the `variantShredding` table feature is present in the table `protocol`'s `readerFeatures` and `writerFeatures`.
 
 # Appendix
 
