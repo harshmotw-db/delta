@@ -1883,8 +1883,8 @@ When Variant type is supported but Variant shredding is not supported (`writerFe
 ## Reader Requirements for Variant Data Type
 
 When Variant type is supported but Variant shredding is not supported (`readerFeatures` field of a table's `protocol` action contains `variantType` but does not contain `variantShredding`), readers:
-- must recognize and tolerate a `variant` data type in a Delta schema
-- must use the correct physical schema (struct-of-binary, with fields `value` and `metadata`) when reading a Variant data type from file
+- must recognize and tolerate a `variant` data type in a Delta schema.
+- must use the correct physical schema (struct-of-binary, with fields `value` and `metadata`) when reading a Variant data type from file.
 - must make the column available to the engine:
     - [Recommended] Expose and interpret the struct-of-binary as a single Variant field in accordance with the [Parquet Variant binary encoding specification](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md).
     - [Alternate] Expose the raw physical struct-of-binary, e.g. if the engine does not support Variant.
@@ -1896,7 +1896,7 @@ Feature | Support for Variant Data Type
 -|-
 Partition Columns | **Supported:** A Variant column is allowed to be a non-partitioned column of a partitioned table. <br/> **Unsupported:** Variant is not a comparable data type, so it cannot be included in a partition column.
 Clustered Tables | **Supported:** A Variant column is allowed to be a non-clustering column of a clustered table. <br/> **Unsupported:** Variant is not a comparable data type, so it cannot be included in a clustering column.
-Delta Column Statistics | **Supported:** A Variant column supports the `nullCount` statistic. <br/> **Conditionally Supported:** A Variant column supports `minValues` and `maxValues` statistics if the table also contains the Variant shredding feature (see [Statistics for Variant Columns](#statistics-for-variant-columns)).
+Delta Column Statistics | **Supported:** A Variant column supports the `nullCount` statistic. <br/> **Conditionally Supported:** A Variant column supports `minValues` and `maxValues` statistics if the table also enables the Variant shredding feature (see [Statistics for Variant Columns](#statistics-for-variant-columns)).
 Generated Columns | **Supported:** A Variant column is allowed to be used as a source in a generated column expression, as long as the Variant type is not the result type of the generated column expression. <br/> **Unsupported:** The Variant data type is not allowed to be the result type of a generated column expression.
 Delta CHECK Constraints | **Supported:** A Variant column is allowed to be used for a CHECK constraint expression.
 Default Column Values | **Supported:** A Variant column is allowed to have a default column value.
@@ -1927,20 +1927,21 @@ Struct field name | Parquet primitive type | Description
 -|-|-
 metadata | binary | (required) The binary-encoded Variant metadata, as described in [Parquet Variant binary encoding](https://github.com/apache/parquet-format/blob/master/VariantEncoding.md)
 value | binary | (optional) The binary-encoded Variant value, as described in Parquet Variant binary encoding.
-typed_value | * | (optional) This can be any Parquet type representing the data stored in the Variant, so long as the shredding scheme adheres to the Parquet Variant Shredding spec. Details of the shredding scheme is found in the Parquet Variant Shredding specification.
+typed_value | * | (optional) This can be any Parquet type representing the data stored in the Variant, so long as the shredding scheme adheres to the Parquet Variant Shredding specification.
 
 ## Writer Requirements for Variant Shredding
 
+Writers must ensure the `variantShredding` table feature is present in the table protocol's `writerFeatures` and `readerFeatures` when enabling the `delta.enableVariantShredding` table property, i.e. setting `delta.enableVariantShredding=true`.
+
 When Variant Shredding is supported (`writerFeatures` field of a table's `protocol` action contains `variantShredding`), writers:
-- must respect the `delta.enableVariantShredding` table property configuration. If `delta.enableVariantShredding` is not present or if it is set to any value other than `true`, a column of type `variant` must not be written as a shredded Variant, but as an unshredded Variant. If `delta.enableVariantShredding=true`, the writer can choose to shred a Variant column according to the [Parquet Variant Shredding specification](https://github.com/apache/parquet-format/blob/master/VariantShredding.md).
-- must ensure the `variantShredding` table feature is present in the table protocol's `writerFeatures` and `readerFeatures` when enabling the `delta.enableVariantShredding` table property, i.e. setting `delta.enableVariantShredding=true`.
 - must ensure the `variantType` table feature is present in the table protocol's `writerFeatures` and `readerFeatures`.
+- must respect the `delta.enableVariantShredding` table property configuration. If `delta.enableVariantShredding` is not present or if it is set to any value other than `true`, a column of type `variant` must not be written as a shredded Variant, but as an unshredded Variant. If `delta.enableVariantShredding=true`, the writer can choose to shred a Variant column according to the [Parquet Variant Shredding specification](https://github.com/apache/parquet-format/blob/master/VariantShredding.md). If `delta.enableVariantShredding=true`, writers are free to write variant columns in the "unshredded" format in parquet files, or write parquet files containing a mix of shredded and unshredded variant columns.
 
 ## Reader Requirements for Variant Shredding
 
 When Variant Shredding is supported (`readerFeatures` field of a table's `protocol` action contains `variantShredding`), readers:
-- must recognize and tolerate a `variant` data type in a Delta schema
-- must recognize and correctly process a parquet schema that is either unshredded (only `metadata` and `value` struct fields) or shredded (`metadata`, optional `value`, and optional `typed_value` struct fields) when reading a Variant data type from file.
+- must recognize and tolerate a `variant` data type in a Delta schema.
+- must recognize and correctly process a parquet schema that is either unshredded (only `metadata` and `value` struct fields) or shredded (`metadata`, optional `value`, and optional `typed_value` struct fields) when reading Variant data from files.
 
 # In-Commit Timestamps
 
