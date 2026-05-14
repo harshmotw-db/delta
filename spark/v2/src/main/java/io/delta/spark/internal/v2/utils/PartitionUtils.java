@@ -23,8 +23,11 @@ import io.delta.kernel.internal.actions.DeletionVectorDescriptor;
 import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
 import io.delta.kernel.internal.tablefeatures.TableFeatures;
+import io.delta.spark.internal.v2.read.ColumnReorderReadFunction;
 import io.delta.spark.internal.v2.read.DeltaParquetFileFormatV2;
 import io.delta.spark.internal.v2.read.SparkReaderFactory;
+import io.delta.spark.internal.v2.read.cdc.CDCReadFunction;
+import io.delta.spark.internal.v2.read.cdc.CDCSchemaContext;
 import io.delta.spark.internal.v2.read.deletionvector.DeletionVectorReadFunction;
 import io.delta.spark.internal.v2.read.deletionvector.DeletionVectorSchemaContext;
 import io.delta.spark.internal.v2.read.rowtracking.RowTrackingReadFunction;
@@ -32,20 +35,27 @@ import io.delta.spark.internal.v2.read.rowtracking.RowTrackingSchemaContext;
 import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.spark.paths.SparkPath;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
+import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.delta.DefaultRowCommitVersion$;
 import org.apache.spark.sql.delta.DeltaColumnMapping;
+import org.apache.spark.sql.delta.DeltaErrors;
 import org.apache.spark.sql.delta.DeltaParquetFileFormat;
 import org.apache.spark.sql.delta.RowId$;
 import org.apache.spark.sql.delta.RowIndexFilterType;
 import org.apache.spark.sql.execution.datasources.FileFormat$;
+import org.apache.spark.sql.execution.datasources.FilePartition;
+import org.apache.spark.sql.execution.datasources.FilePartition$;
 import org.apache.spark.sql.execution.datasources.PartitionedFile;
 import org.apache.spark.sql.execution.datasources.PartitioningUtils;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetUtils;
@@ -57,6 +67,7 @@ import scala.Function1;
 import scala.Option;
 import scala.Tuple2;
 import scala.collection.Iterator;
+import scala.collection.JavaConverters;
 import scala.jdk.javaapi.CollectionConverters;
 
 /** Utility class for partition-related operations shared across Delta Kernel Spark components. */
@@ -104,18 +115,31 @@ public class PartitionUtils {
   }
 
   /**
+   * Plan input partitions by bin-packing a list of {@link PartitionedFile}s into {@link
+   * FilePartition}s.
+   */
+  public static InputPartition[] planInputPartitions(
+      SparkSession sparkSession,
+      List<PartitionedFile> partitionedFiles,
+      long totalBytes,
+      Configuration hadoopConf,
+      SQLConf sqlConf) {
+    long maxSplitBytes =
+        calculateMaxSplitBytes(sparkSession, totalBytes, partitionedFiles.size(), sqlConf);
+    scala.collection.Seq<FilePartition> filePartitions =
+        FilePartition$.MODULE$.getFilePartitions(
+            sparkSession, JavaConverters.asScalaBuffer(partitionedFiles).toSeq(), maxSplitBytes);
+
+    return JavaConverters.seqAsJavaList(filePartitions).toArray(new InputPartition[0]);
+  }
+
+  /**
    * Build the partition {@link InternalRow} from kernel partition values by casting them to the
    * desired Spark types using the session time zone for temporal types.
    *
    * <p>Note: Partition values in AddFile use physical column names as keys when column mapping is
    * enabled. This method uses DeltaColumnMapping.getPhysicalName to map from logical schema fields
    * to physical partition value keys.
-   *
-   * @implNote The returned {@link InternalRow} is a {@code GenericInternalRow} (via {@code
-   *     InternalRow.fromSeq}), which has value-based {@code equals()}/{@code hashCode()}. Callers
-   *     such as {@code SparkBatch.planPartitionedInputPartitions} rely on this for grouping files
-   *     by partition key. Changing the return type to a different InternalRow subtype (e.g. {@code
-   *     UnsafeRow}) may break that contract.
    */
   public static InternalRow getPartitionRow(
       MapValue partitionValues, StructType partitionSchema, ZoneId zoneId) {
@@ -152,8 +176,7 @@ public class PartitionUtils {
                 : PartitioningUtils.castPartValueToDesiredType(field.dataType(), strVal, zoneId);
       }
     }
-    return InternalRow.fromSeq(
-        CollectionConverters.asScala(Arrays.asList(values).iterator()).toSeq());
+    return new GenericInternalRow(values);
   }
 
   /**
@@ -167,34 +190,107 @@ public class PartitionUtils {
    */
   public static PartitionedFile buildPartitionedFile(
       AddFile addFile, StructType partitionSchema, String tablePath, ZoneId zoneId) {
-    InternalRow partitionRow =
-        getPartitionRow(addFile.getPartitionValues(), partitionSchema, zoneId);
+    scala.collection.immutable.Map<String, Object> metadata =
+        mergeIntoScalaMap(
+            buildDvMetadata(addFile.getDeletionVector()),
+            buildRowTrackingMetadata(addFile.getBaseRowId(), addFile.getDefaultRowCommitVersion()));
+    return makePartitionedFile(
+        new Path(tablePath, addFile.getPath()).toString(),
+        addFile.getSize(),
+        addFile.getModificationTime(),
+        getPartitionRow(addFile.getPartitionValues(), partitionSchema, zoneId),
+        metadata);
+  }
 
-    // Preferred node locations are not used.
-    String[] preferredLocations = new String[0];
-
-    // Build metadata map with DV info if present
-    scala.collection.immutable.Map<String, Object> deletionVectorMetadata =
-        buildDvMetadata(addFile.getDeletionVector());
-    scala.collection.immutable.Map<String, Object> rowTrackingMetadata =
-        buildRowTrackingMetadata(addFile.getBaseRowId(), addFile.getDefaultRowCommitVersion());
-    scala.collection.immutable.Map<String, Object> otherConstantMetadataColumnValues =
-        deletionVectorMetadata;
-    for (Map.Entry<String, Object> entry :
-        CollectionConverters.asJava(rowTrackingMetadata).entrySet()) {
-      otherConstantMetadataColumnValues =
-          otherConstantMetadataColumnValues.$plus(new Tuple2<>(entry.getKey(), entry.getValue()));
+  /**
+   * Build a PartitionedFile from a CDCDataFile with CDC constants in
+   * otherConstantMetadataColumnValues for the {@link CDCReadFunction} to null-coalesce.
+   *
+   * <p>Row tracking metadata is intentionally NOT included: per Delta protocol "Reader Requirements
+   * for Row Tracking", readers must not expose row IDs / row commit versions while reading change
+   * data files from {@code cdc} actions.
+   */
+  public static PartitionedFile buildCDCPartitionedFile(
+      io.delta.spark.internal.v2.read.CDCDataFile cdcFile,
+      long commitVersion,
+      StructType partitionSchema,
+      String tablePath,
+      ZoneId zoneId) {
+    Map<String, Object> cdcConstants = new HashMap<>();
+    cdcConstants.put(CDCSchemaContext.CDC_COMMIT_VERSION, commitVersion);
+    cdcConstants.put(
+        CDCSchemaContext.CDC_COMMIT_TIMESTAMP,
+        TimeUnit.MILLISECONDS.toMicros(cdcFile.getCommitTimestamp()));
+    if (!cdcFile.isAddCDCFile()) {
+      cdcConstants.put(CDCSchemaContext.CDC_TYPE_COLUMN, cdcFile.getChangeType());
     }
+    scala.collection.immutable.Map<String, Object> metadata =
+        buildDvMetadata(getCDCFileDvDescriptor(cdcFile));
+    for (Map.Entry<String, Object> entry : cdcConstants.entrySet()) {
+      metadata = metadata.$plus(new Tuple2<>(entry.getKey(), entry.getValue()));
+    }
+    MapValue partitionValues = cdcFile.getPartitionValues();
+    if (partitionValues == null) {
+      // Only RemoveFile reaches here, when extendedFileMetadata is absent. Match V1's
+      // TahoeRemoveFileIndex behaviour rather than silently consuming missing metadata.
+      throw (RuntimeException) DeltaErrors.removeFileCDCMissingExtendedMetadata(cdcFile.getPath());
+    }
+    InternalRow partitionRow =
+        partitionSchema.fields().length > 0
+            ? getPartitionRow(partitionValues, partitionSchema, zoneId)
+            : emptyPartitionRow(0);
+    long modificationTime =
+        cdcFile.getAddFile() != null
+            ? cdcFile.getAddFile().getModificationTime()
+            : cdcFile.getCommitTimestamp();
+    return makePartitionedFile(
+        new Path(tablePath, cdcFile.getPath()).toString(),
+        cdcFile.getFileSize(),
+        modificationTime,
+        partitionRow,
+        metadata);
+  }
 
+  private static PartitionedFile makePartitionedFile(
+      String path,
+      long size,
+      long modificationTime,
+      InternalRow partitionRow,
+      scala.collection.immutable.Map<String, Object> metadata) {
     return new PartitionedFile(
         partitionRow,
-        SparkPath.fromUrlString(new Path(tablePath, addFile.getPath()).toString()),
+        SparkPath.fromUrlString(path),
         /* start= */ 0L,
-        /* length= */ addFile.getSize(),
-        preferredLocations,
-        addFile.getModificationTime(),
-        /* fileSize= */ addFile.getSize(),
-        otherConstantMetadataColumnValues);
+        /* length= */ size,
+        /* preferredLocations= */ new String[0],
+        modificationTime,
+        /* fileSize= */ size,
+        metadata);
+  }
+
+  private static InternalRow emptyPartitionRow(int numFields) {
+    return new GenericInternalRow(new Object[numFields]);
+  }
+
+  private static scala.collection.immutable.Map<String, Object> mergeIntoScalaMap(
+      scala.collection.immutable.Map<String, Object> base,
+      scala.collection.immutable.Map<String, Object> additions) {
+    scala.collection.immutable.Map<String, Object> result = base;
+    for (Map.Entry<String, Object> entry : CollectionConverters.asJava(additions).entrySet()) {
+      result = result.$plus(new Tuple2<>(entry.getKey(), entry.getValue()));
+    }
+    return result;
+  }
+
+  private static Optional<DeletionVectorDescriptor> getCDCFileDvDescriptor(
+      io.delta.spark.internal.v2.read.CDCDataFile cdcFile) {
+    if (cdcFile.getAddFile() != null) {
+      return cdcFile.getAddFile().getDeletionVector();
+    }
+    if (cdcFile.getRemoveFile() != null) {
+      return cdcFile.getRemoveFile().getDeletionVector();
+    }
+    return Optional.empty();
   }
 
   /**
@@ -212,21 +308,39 @@ public class PartitionUtils {
    * </ol>
    *
    * @param snapshot The Delta table snapshot containing protocol, metadata, and table path
+   * @param isCDCRead If true, augments the read schema with CDC columns and wraps the reader with
+   *     {@link CDCReadFunction} to null-coalesce CDC metadata from per-file constants.
    */
   public static PartitionReaderFactory createDeltaParquetReaderFactory(
       Snapshot snapshot,
       StructType dataSchema,
       StructType partitionSchema,
       StructType readDataSchema,
+      StructType ddlOrderedReadOutputSchema,
       Filter[] dataFilters,
       scala.collection.immutable.Map<String, String> scalaOptions,
       Configuration hadoopConf,
-      SQLConf sqlConf) {
+      SQLConf sqlConf,
+      boolean isCDCRead) {
     SnapshotImpl snapshotImpl = (SnapshotImpl) snapshot;
     // Use Path.toString() instead of toUri().toString() to avoid URL encoding issues.
     // toUri().toString() encodes special characters (e.g., space -> %20), which causes
     // DV file path resolution failures.
     String tablePath = snapshotImpl.getDataPath().toString();
+
+    // Preserve the caller-provided readDataSchema (pre-DV/RT/CDC augmentation) for the final
+    // column-reorder wrapper below.
+    final StructType originalReadDataSchema = readDataSchema;
+
+    // For CDC reads, build the schema context and augment readDataSchema with CDC columns
+    // before DV wrapping so that DV column indices account for them.
+    Optional<CDCSchemaContext> cdcSchemaContext =
+        isCDCRead
+            ? Optional.of(new CDCSchemaContext(readDataSchema, partitionSchema))
+            : Optional.empty();
+    if (cdcSchemaContext.isPresent()) {
+      readDataSchema = cdcSchemaContext.get().getReadDataSchemaWithCDC();
+    }
 
     boolean metadataColumnRequested =
         Arrays.stream(readDataSchema.fields())
@@ -267,7 +381,7 @@ public class PartitionUtils {
         dvSchemaContext.isPresent() ? Option.apply(Boolean.FALSE) : Option.empty();
     DeltaParquetFileFormatV2 deltaFormat =
         createDeltaParquetFileFormat(
-            snapshot, tablePath, optimizationsEnabled, useMetadataRowIndex);
+            snapshot, tablePath, optimizationsEnabled, useMetadataRowIndex, isCDCRead);
 
     Function1<PartitionedFile, Iterator<InternalRow>> readFunc =
         deltaFormat.buildReaderWithPartitionValues(
@@ -288,11 +402,32 @@ public class PartitionUtils {
     }
 
     // Wrap reader to add rowTracking metadata.
-    // RT is the outer wrapper: _tmp_metadata_row_index values are per-row physical positions
-    // generated by the Parquet reader, so they remain correct after DV filtering.
+    // RT wraps DV: _tmp_metadata_row_index values are per-row physical positions generated by
+    // the Parquet reader, so they remain correct after DV filtering.
     if (rowTrackingSchemaContext.isPresent()) {
       readFunc = RowTrackingReadFunction.wrap(readFunc, rowTrackingSchemaContext.get());
     }
+
+    // TODO(#5319): add e2e test for CDC reads (full schema + column pruning) when CDC reads
+    // become user-reachable.
+    if (cdcSchemaContext.isPresent()) {
+      if (rowTrackingSchemaContext.isPresent()) {
+        throw new UnsupportedOperationException(
+            "CDC reads combined with row tracking are not supported");
+      }
+      readFunc = CDCReadFunction.wrap(readFunc, cdcSchemaContext.get(), enableVectorizedReader);
+    }
+
+    // DV and RT strip their internal helpers before yielding; CDC appends its fields at the tail.
+    // The wrapper infers the source layout from (data, partition, target) - CDC tail fields end up
+    // identity-mapped while data/partition columns are permuted into DDL order.
+    readFunc =
+        ColumnReorderReadFunction.wrap(
+            readFunc,
+            enableVectorizedReader,
+            originalReadDataSchema,
+            partitionSchema,
+            ddlOrderedReadOutputSchema);
 
     return new SparkReaderFactory(readFunc, enableVectorizedReader);
   }
@@ -310,7 +445,8 @@ public class PartitionUtils {
       Snapshot snapshot,
       String tablePath,
       boolean optimizationsEnabled,
-      Option<Boolean> useMetadataRowIndex) {
+      Option<Boolean> useMetadataRowIndex,
+      boolean isCDCRead) {
     SnapshotImpl snapshotImpl = (SnapshotImpl) snapshot;
     return new DeltaParquetFileFormatV2(
         snapshotImpl.getProtocol(),
@@ -319,7 +455,7 @@ public class PartitionUtils {
         /* nullableRowTrackingGeneratedFields */ false,
         optimizationsEnabled,
         Option.apply(tablePath),
-        /* isCDCRead */ false,
+        isCDCRead,
         useMetadataRowIndex);
   }
 

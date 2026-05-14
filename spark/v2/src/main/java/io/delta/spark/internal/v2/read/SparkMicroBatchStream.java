@@ -74,8 +74,6 @@ import org.apache.spark.sql.delta.sources.DeltaSource;
 import org.apache.spark.sql.delta.sources.DeltaSourceOffset;
 import org.apache.spark.sql.delta.sources.DeltaSourceOffset$;
 import org.apache.spark.sql.delta.sources.DeltaStreamUtils;
-import org.apache.spark.sql.execution.datasources.FilePartition;
-import org.apache.spark.sql.execution.datasources.FilePartition$;
 import org.apache.spark.sql.execution.datasources.PartitionedFile;
 import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.sources.Filter;
@@ -87,7 +85,6 @@ import org.slf4j.LoggerFactory;
 import scala.Function2;
 import scala.Option;
 import scala.Some;
-import scala.collection.JavaConverters;
 import scala.collection.immutable.Seq;
 import scala.collection.immutable.Seq$;
 import scala.jdk.javaapi.CollectionConverters;
@@ -144,6 +141,7 @@ public class SparkMicroBatchStream
   private final StructType readDataSchema;
   private final StructType dataSchema;
   private final StructType partitionSchema;
+  private final StructType ddlOrderedReadOutputSchema;
   private final Filter[] dataFilters;
   private final Configuration hadoopConf;
   private final SQLConf sqlConf;
@@ -170,6 +168,9 @@ public class SparkMicroBatchStream
    * changes (rename / drop).
    */
   private volatile boolean hasCheckedReadIncompatibleSchemaChangesOnStreamStart = false;
+
+  /** One-shot flag for {@link #validateCDFEnabledOnTable}. */
+  private volatile boolean cdfEnabledOnStreamStartValidated = false;
 
   /**
    * When AvailableNow is used, this offset will be the upper bound where this run of the query will
@@ -214,6 +215,7 @@ public class SparkMicroBatchStream
       StructType dataSchema,
       StructType partitionSchema,
       StructType readDataSchema,
+      StructType ddlOrderedReadOutputSchema,
       Filter[] dataFilters,
       scala.collection.immutable.Map<String, String> scalaOptions) {
     this.snapshotManager = Objects.requireNonNull(snapshotManager, "snapshotManager is null");
@@ -234,6 +236,8 @@ public class SparkMicroBatchStream
     this.dataSchema = Objects.requireNonNull(dataSchema, "dataSchema is null");
     this.partitionSchema = Objects.requireNonNull(partitionSchema, "partitionSchema is null");
     this.readDataSchema = Objects.requireNonNull(readDataSchema, "readDataSchema is null");
+    this.ddlOrderedReadOutputSchema =
+        Objects.requireNonNull(ddlOrderedReadOutputSchema, "ddlOrderedReadOutputSchema is null");
     this.dataFilters =
         Arrays.copyOf(
             Objects.requireNonNull(dataFilters, "dataFilters is null"), dataFilters.length);
@@ -470,25 +474,23 @@ public class SparkMicroBatchStream
 
     List<PartitionedFile> partitionedFiles = new ArrayList<>();
     long totalBytesToRead = 0;
-    try (CloseableIterator<IndexedFile> fileChanges =
-        getFileChanges(fromVersion, fromIndex, isInitialSnapshot, Optional.of(endOffset))) {
-      while (fileChanges.hasNext()) {
-        IndexedFile indexedFile = fileChanges.next();
-        if (indexedFile.getAddFile() == null) {
-          continue;
-        }
-        AddFile addFile = indexedFile.getAddFile();
-        // TODO(#5319): Apply excludeRegex to RemoveFile/AddCDCFile when CDC is supported
-        if (excludeRegex.isPresent()
-            && excludeRegex.get().findFirstIn(addFile.getPath()).isDefined()) {
-          continue;
-        }
-        PartitionedFile partitionedFile =
-            PartitionUtils.buildPartitionedFile(
-                addFile, partitionSchema, tablePath, ZoneId.of(sqlConf.sessionLocalTimeZone()));
+    boolean isCDC = options.readChangeFeed();
+    ZoneId zoneId = ZoneId.of(sqlConf.sessionLocalTimeZone());
 
-        totalBytesToRead += addFile.getSize();
-        partitionedFiles.add(partitionedFile);
+    try (CloseableIterator<IndexedFile> fileChanges =
+        isCDC
+            ? getFileChangesWithRateLimitForCDC(
+                fromVersion,
+                fromIndex,
+                isInitialSnapshot,
+                /* limits= */ Optional.empty(),
+                Optional.of(endOffset))
+            : getFileChanges(fromVersion, fromIndex, isInitialSnapshot, Optional.of(endOffset))) {
+      while (fileChanges.hasNext()) {
+        PartitionedFile pf = buildPartitionedFile(fileChanges.next(), isCDC, zoneId);
+        if (pf == null) continue;
+        totalBytesToRead += pf.fileSize();
+        partitionedFiles.add(pf);
       }
     } catch (IOException e) {
       throw new RuntimeException(
@@ -507,14 +509,8 @@ public class SparkMicroBatchStream
       throw e;
     }
 
-    long maxSplitBytes =
-        PartitionUtils.calculateMaxSplitBytes(
-            spark, totalBytesToRead, partitionedFiles.size(), sqlConf);
-    // Partitions files into Spark FilePartitions.
-    Seq<FilePartition> filePartitions =
-        FilePartition$.MODULE$.getFilePartitions(
-            spark, JavaConverters.asScalaBuffer(partitionedFiles).toSeq(), maxSplitBytes);
-    return JavaConverters.seqAsJavaList(filePartitions).toArray(new InputPartition[0]);
+    return PartitionUtils.planInputPartitions(
+        spark, partitionedFiles, totalBytesToRead, hadoopConf, sqlConf);
   }
 
   @Override
@@ -524,10 +520,32 @@ public class SparkMicroBatchStream
         dataSchema,
         partitionSchema,
         readDataSchema,
+        ddlOrderedReadOutputSchema,
         dataFilters,
         scalaOptions,
         hadoopConf,
-        sqlConf);
+        sqlConf,
+        /* isCDCRead */ options.readChangeFeed());
+  }
+
+  /**
+   * Returns a {@link PartitionedFile} for the given {@link IndexedFile}, or {@code null} if the
+   * file should be skipped (no AddFile/CDC payload, or path matches the excludeRegex).
+   */
+  private PartitionedFile buildPartitionedFile(
+      IndexedFile indexedFile, boolean isCDC, ZoneId zoneId) {
+    if (indexedFile.getAddFile() != null) {
+      AddFile addFile = indexedFile.getAddFile();
+      if (isExcludedPath(addFile.getPath())) return null;
+      return PartitionUtils.buildPartitionedFile(addFile, partitionSchema, tablePath, zoneId);
+    }
+    if (isCDC && indexedFile.getCDCDataFile() != null) {
+      CDCDataFile cdcFile = indexedFile.getCDCDataFile();
+      if (isExcludedPath(cdcFile.getPath())) return null;
+      return PartitionUtils.buildCDCPartitionedFile(
+          cdcFile, indexedFile.getVersion(), partitionSchema, tablePath, zoneId);
+    }
+    return null;
   }
 
   ///////////////
@@ -558,6 +576,10 @@ public class SparkMicroBatchStream
     return Optional.empty();
   }
 
+  private boolean isExcludedPath(String path) {
+    return excludeRegex.isPresent() && excludeRegex.get().findFirstIn(path).isDefined();
+  }
+
   ///////////////////////
   // getStartingVersion //
   ///////////////////////
@@ -577,8 +599,8 @@ public class SparkMicroBatchStream
     // Note: returning a version beyond latest snapshot version won't be a problem as callers
     // of this function won't use the version to retrieve snapshot(refer to
     // [[getStartingOffset]]).
-    // TODO(#5319): fetch spark config if CDF is supported.
-    boolean allowOutOfRange = false;
+    boolean allowOutOfRange =
+        (Boolean) sqlConf.getConf(DeltaSQLConf.DELTA_CDF_ALLOW_OUT_OF_RANGE_TIMESTAMP());
 
     if (options.startingVersion().isDefined()) {
       DeltaStartingVersion startingVersion = options.startingVersion().get();
@@ -596,7 +618,7 @@ public class SparkMicroBatchStream
           // check is skipped, so this is technically not safe, but we keep it this way for
           // historical reasons.
           snapshotManager.checkVersionExists(
-              version, /* mustBeRecreatable= */ false, /* allowOutOfRange= */ false);
+              version, /* mustBeRecreatable= */ false, allowOutOfRange);
         }
         cachedStartingVersion = Optional.of(version);
         return cachedStartingVersion;
@@ -785,7 +807,7 @@ public class SparkMicroBatchStream
       boolean isInitialSnapshot,
       Optional<DeltaSource.AdmissionLimits> limits,
       Optional<DeltaSourceOffset> endOffset) {
-    validateCDFEnabledOnTable();
+    validateCDFEnabledOnTable(fromVersion);
     CloseableIterator<IndexedFile> result;
     if (isInitialSnapshot) {
       InitialSnapshotCache snapshot = getSnapshotFiles(fromVersion);
@@ -880,14 +902,30 @@ public class SparkMicroBatchStream
     return result;
   }
 
-  private void validateCDFEnabledOnTable() {
-    if (!isCDFEnabled(snapshotAtSourceInit.getMetadata())) {
-      long version = snapshotAtSourceInit.getVersion();
-      // DeltaErrors.changeDataNotRecordedException returns a DeltaAnalysisException (checked),
-      // so we wrap it to propagate through the streaming pipeline.
-      Throwable error = DeltaErrors.changeDataNotRecordedException(version, version, version);
-      throw new RuntimeException(error.getMessage(), error);
+  @VisibleForTesting
+  void validateCDFEnabledOnTable(long startVersion) {
+    // Make sure CDF is enabled at startVersion during stream start.
+    if (cdfEnabledOnStreamStartValidated) {
+      return;
     }
+    SnapshotImpl startSnapshot;
+    if (startVersion == snapshotAtSourceInit.getVersion()) {
+      startSnapshot = snapshotAtSourceInit;
+    } else {
+      try {
+        startSnapshot = (SnapshotImpl) snapshotManager.loadSnapshotAt(startVersion);
+      } catch (io.delta.kernel.exceptions.KernelException e) {
+        // startVersion may not yet exist (e.g. startingVersion=latest resolves to latest+1).
+        // TODO(#6745): narrow this catch once kernel exposes a specific exception subclass
+        // for "version not yet materialized".
+        return;
+      }
+    }
+    if (!isCDFEnabled(startSnapshot.getMetadata())) {
+      throw new RuntimeException(
+          DeltaErrors.changeDataNotRecordedException(startVersion, startVersion, startVersion));
+    }
+    cdfEnabledOnStreamStartValidated = true;
   }
 
   private CloseableIterator<IndexedFile> filterDeltaLogs(
@@ -1845,16 +1883,20 @@ public class SparkMicroBatchStream
 
   /** Converts a list of IndexedFiles to a Scala Seq of AdmittableFile for batch admission. */
   private static Seq<AdmittableFile> toScalaAdmittableSeq(List<IndexedFile> files) {
-    return JavaConverters.asScalaBuffer(
+    return CollectionConverters.asScala(
             files.stream().map(f -> (AdmittableFile) f).collect(Collectors.toList()))
         .toSeq();
   }
 
   private static boolean isCDFEnabled(Metadata metadata) {
-    return metadata
-        .getConfiguration()
-        .getOrDefault("delta.enableChangeDataFeed", "false")
-        .equalsIgnoreCase("true");
+    // Fall back to the deprecated delta.enableChangeDataCapture key when
+    // delta.enableChangeDataFeed is not set.
+    Map<String, String> config = metadata.getConfiguration();
+    String value = config.get("delta.enableChangeDataFeed");
+    if (value == null) {
+      value = config.get("delta.enableChangeDataCapture");
+    }
+    return value != null && value.equalsIgnoreCase("true");
   }
 
   /** Checks if the endOffset is at BASE_INDEX for the given version (early exit condition). */

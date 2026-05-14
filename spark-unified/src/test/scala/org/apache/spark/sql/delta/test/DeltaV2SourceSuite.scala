@@ -1,5 +1,5 @@
 /*
- * Copyright (2021) The Delta Lake Project Authors.
+ * Copyright (2025) The Delta Lake Project Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,7 +46,13 @@ class DeltaV2SourceSuite extends DeltaSourceSuite with V2ForceTest {
     )
   }
 
-  private lazy val shouldPassTests = Set(
+  /** Path-based ALTER TABLE doesn't work under V2_ENABLE_MODE=STRICT; route through V1. */
+  override protected def renameColumn(
+      tablePath: String, oldName: String, newName: String): Unit = {
+    executeInV1Mode(s"ALTER TABLE delta.`$tablePath` RENAME COLUMN $oldName TO $newName")
+  }
+
+  override protected def shouldPassTests: Set[String] = Set(
     // ========== Core streaming tests ==========
     "basic",
     "initial snapshot ends at base index of next version",
@@ -132,10 +138,15 @@ class DeltaV2SourceSuite extends DeltaSourceSuite with V2ForceTest {
     "should not attempt to read a non exist version",
     "can delete old files of a snapshot without update",
     "Delta source advances with non-data inserts and generates empty dataframe for " +
-      "non-data operations"
+      "non-data operations",
+    "reading from table with multiple partition columns succeeds during restart",
+    "streaming read returns correct data from table with partition column in middle",
+    "streaming read with column pruning and partition column in middle",
+    "streaming read with column mapping id and partition column in middle",
+    "streaming read after column rename with partition column in middle"
   )
 
-  private lazy val shouldFailTests = Set(
+  override protected def shouldFailTests: Set[String] = Set(
     // === Null Type Column Handling ===
     "streaming delta source should not drop null columns",
     "streaming delta source should drop null columns without feature flag",
@@ -172,15 +183,4 @@ class DeltaV2SourceSuite extends DeltaSourceSuite with V2ForceTest {
     // Calls deltaSource.createSource() directly
     "createSource should create source with empty or matching table schema provided"
   )
-
-  override protected def shouldFail(testName: String): Boolean = {
-    val inPassList = shouldPassTests.contains(testName)
-    val inFailList = shouldFailTests.contains(testName)
-
-    assert(inPassList || inFailList, s"Test '$testName' not in shouldPassTests or shouldFailTests")
-    assert(!(inPassList && inFailList),
-      s"Test '$testName' in both shouldPassTests and shouldFailTests")
-
-    inFailList
-  }
 }
